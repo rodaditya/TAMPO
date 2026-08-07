@@ -581,6 +581,56 @@
   @media (prefers-reduced-motion: reduce) {
     * { transition: none !important; }
   }
+
+  /* ============ DRAG STATE (added for real Sortable wiring) ============ */
+  .sortable-ghost { opacity: 0.35; }
+  .sortable-drag { cursor: grabbing; }
+  .task-card[draggable], .task-card { cursor: grab; }
+
+  .wip-flag {
+    display: inline-block;
+    margin-left: 6px;
+    padding: 1px 6px;
+    border-radius: 4px;
+    font-size: 9px;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    background: var(--accent-soft);
+    color: var(--accent);
+    vertical-align: middle;
+  }
+
+  /* small field note used in the effort / WIP-override popups */
+  .field-hint {
+    font-size: 11px;
+    color: var(--text-tertiary);
+    margin: 4px 0 0;
+  }
+
+  /* toast for failed background syncs */
+  .sync-toast {
+    position: fixed;
+    bottom: 28px;
+    left: 32px;
+    max-width: 320px;
+    background: var(--surface-raised);
+    border: 1px solid var(--sig-red);
+    color: var(--text-primary);
+    padding: 10px 14px;
+    border-radius: var(--radius-md);
+    font-size: 12.5px;
+    box-shadow: var(--shadow);
+    z-index: 60;
+    opacity: 0;
+    transform: translateY(8px);
+    transition: opacity .2s ease, transform .2s ease;
+    pointer-events: none;
+  }
+  .sync-toast.show { opacity: 1; transform: translateY(0); }
+
+  @media (max-width: 720px) {
+    .sync-toast { left: 16px; right: 16px; max-width: none; }
+  }
 </style>
 </head>
 <body>
@@ -642,16 +692,22 @@
       </div>
     </div>
 
-    <div class="field-block">
-      <label for="taskModalStatus">Status</label>
-      <select id="taskModalStatus">
-        <option value="not-picked">Not Picked</option>
-        <option value="on-track">On Track</option>
-        <option value="at-risk">At Risk</option>
-        <option value="overdue">Overdue</option>
-        <option value="completed">Completed</option>
-      </select>
+    <div class="field-row">
+      <div class="field-block">
+        <label for="taskModalStatus">Status</label>
+        <select id="taskModalStatus">
+          <option value="Not Picked">Not Picked</option>
+          <option value="Next Up">Next Up</option>
+          <option value="WIP">WIP</option>
+          <option value="Done">Done</option>
+        </select>
+      </div>
+      <div class="field-block">
+        <label for="taskModalEffort">Effort Estimation (days)</label>
+        <input type="number" id="taskModalEffort" min="0.5" step="0.5" placeholder="e.g. 2">
+      </div>
     </div>
+    <p class="field-hint" id="taskModalEffortHint" style="display:none;">Required before moving out of "Not Picked".</p>
 
     <div class="modal-footer">
       <button class="btn" data-close-modal="taskModalOverlay">Cancel</button>
@@ -704,55 +760,166 @@
   </div>
 </div>
 
-<script>
-/* ============ DUMMY DATA ============ */
+<script type="module">
+/* =========================================================================
+   PART A — BACKEND CLIENT  (was api-service.js)
+   Thin wrapper around the Apps Script Web App. Deploy Code.gs first, then
+   the /exec URL below must point at that deployment.
+   ========================================================================= */
+const SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbzN33vomd4IsSBYMTdo5QAnyu4KZHLu2k5_vlA-vF6uiABvKE7aX_18dL83fgzcnHzR/exec';
+
+async function fetchTasks() {
+  const res = await fetch(`${SCRIPT_URL}?action=list`);
+  const data = await res.json();
+  if (data.error) throw new Error(data.error);
+  return data;
+}
+
+async function createTask(taskData) {
+  const res = await fetch(SCRIPT_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'text/plain;charset=utf-8' }, // avoids CORS preflight against Apps Script
+    body: JSON.stringify({ action: 'create', data: taskData })
+  });
+  const data = await res.json();
+  if (data.error) throw new Error(data.error);
+  return data;
+}
+
+async function updateTask(taskId, updatedFields) {
+  const res = await fetch(SCRIPT_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+    body: JSON.stringify({ action: 'update', taskId, fields: updatedFields })
+  });
+  const data = await res.json();
+  if (data.error) throw new Error(data.error);
+  return data;
+}
+
+async function deleteTaskRemote(taskId) {
+  const res = await fetch(SCRIPT_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+    body: JSON.stringify({ action: 'delete', taskId })
+  });
+  const data = await res.json();
+  if (data.error) throw new Error(data.error);
+  return data;
+}
+
+/** Working days (Mon-Fri) strictly between two dates. */
+function getWorkingDaysBetween(startDate, endDate) {
+  let count = 0;
+  const cur = new Date(startDate);
+  cur.setHours(0, 0, 0, 0);
+  const end = new Date(endDate);
+  end.setHours(0, 0, 0, 0);
+  const step = end >= cur ? 1 : -1;
+  while (cur.getTime() !== end.getTime()) {
+    cur.setDate(cur.getDate() + step);
+    const day = cur.getDay();
+    if (day !== 0 && day !== 6) count += step;
+  }
+  return count;
+}
+
+/** Add N working days to a date. */
+function addWorkingDays(startDate, numDays) {
+  const cur = new Date(startDate);
+  let added = 0;
+  const n = Math.round(numDays);
+  while (added < n) {
+    cur.setDate(cur.getDate() + 1);
+    const day = cur.getDay();
+    if (day !== 0 && day !== 6) added++;
+  }
+  return cur;
+}
+
+/* =========================================================================
+   PART B — STATIC ASSIGNEE ROSTER (UI-only metadata: role + initials).
+   Assigned_To on a task record is the person's display name, matching
+   ASSIGNEES[].name — that's the join key back to this roster.
+   ========================================================================= */
 const ASSIGNEES = [
   { id: "ar", name: "Aditi Rao",    role: "Business Analyst", initials: "AR" },
   { id: "vs", name: "Vikram Singh", role: "Product Ops",      initials: "VS" },
   { id: "pm", name: "Priya Menon",  role: "Data Engineer",    initials: "PM" },
   { id: "km", name: "Karan Mehta",  role: "Frontend Eng",     initials: "KM" },
 ];
+const assigneeById   = (id)   => ASSIGNEES.find(a => a.id === id);
+const assigneeByName = (name) => ASSIGNEES.find(a => a.name === name);
 
-const TASKS = [
-  { id: 1, name: "Audit 99Acres listing recommendation weights", description: "Review scoring weights in the recommendation engine for real-estate listings and flag anomalies in the top-K output.", owner: "Rhea Kapoor", ownerInitials: "RK", assignee: "ar", deadline: "2026-08-08", estCompletion: "2026-08-07", daysLeft: 1, daysTotal: 5, status: "at-risk" },
-  { id: 2, name: "Build builder revenue email digest v2", description: "Extend the automated HTML email report to include week-over-week builder revenue deltas.", owner: "Aditi Rao", ownerInitials: "AR", assignee: "ar", deadline: "2026-08-12", estCompletion: "2026-08-11", daysLeft: 5, daysTotal: 7, status: "on-track" },
-  { id: 3, name: "Draft NP Revenue Boost logic doc v3", description: "Translate the latest recommendation engine business rules into the product logic document for stakeholder review.", owner: "Vikram Singh", ownerInitials: "VS", assignee: "ar", deadline: "2026-08-03", estCompletion: "2026-08-05", daysLeft: -2, daysTotal: 6, status: "overdue" },
-  { id: 4, name: "Backfill Presto schema for Jeevansathi events", description: "Not yet started — waiting on data engineering to confirm partition strategy.", owner: "Priya Menon", ownerInitials: "PM", assignee: "ar", deadline: "2026-08-20", estCompletion: "—", daysLeft: 13, daysTotal: 13, status: "not-picked" },
+const STATUS_VALUES = ["Not Picked", "Next Up", "WIP", "Done"];
 
-  { id: 5, name: "Migrate Hive pipeline to incremental loads", description: "Convert the nightly full-refresh job to incremental partition loads to cut runtime.", owner: "Priya Menon", ownerInitials: "PM", assignee: "vs", deadline: "2026-08-09", estCompletion: "2026-08-09", daysLeft: 2, daysTotal: 4, status: "at-risk" },
-  { id: 6, name: "Naukri employer dashboard QA pass", description: "Run through the employer-facing analytics dashboard for edge cases in filter combinations.", owner: "Karan Mehta", ownerInitials: "KM", assignee: "vs", deadline: "2026-08-15", estCompletion: "2026-08-13", daysLeft: 8, daysTotal: 8, status: "on-track" },
-  { id: 7, name: "Reconcile Shiksha lead attribution mismatch", description: "Investigate discrepancy between CRM lead counts and the attribution pipeline for August.", owner: "Vikram Singh", ownerInitials: "VS", assignee: "vs", deadline: "2026-08-06", estCompletion: "2026-08-09", daysLeft: -1, daysTotal: 5, status: "overdue" },
-
-  { id: 8, name: "Set up recurring weekly stakeholder report", description: "Automate the weekly summary deck pull for leadership review of key BI metrics.", owner: "Aditi Rao", ownerInitials: "AR", assignee: "pm", deadline: "2026-08-14", estCompletion: "2026-08-14", daysLeft: 7, daysTotal: 7, status: "on-track" },
-  { id: 9, name: "Spec out assignee estimate field for task tool", description: "Draft requirements for the new estimated-completion-date field across task views.", owner: "Karan Mehta", ownerInitials: "KM", assignee: "pm", deadline: "2026-08-22", estCompletion: "—", daysLeft: 15, daysTotal: 15, status: "not-picked" },
-];
-
-const COMPLETED_TASKS = {
-  ar: [
-    { id: 101, name: "Ship Q2 builder revenue retro deck", owner: "Aditi Rao", ownerInitials: "AR", assignee: "ar", description: "Quarterly retrospective summarizing builder revenue trends and anomalies for leadership.", deadline: "2026-07-28", estCompletion: "2026-07-27" },
-    { id: 102, name: "Fix Presto join skew on listings table", owner: "Priya Menon", ownerInitials: "PM", assignee: "ar", description: "Resolved data skew causing slow joins in the nightly listings aggregation job.", deadline: "2026-07-20", estCompletion: "2026-07-19" },
-  ],
-  vs: [
-    { id: 103, name: "Migrate legacy filter UI to new component", owner: "Karan Mehta", ownerInitials: "KM", assignee: "vs", description: "Replaced the legacy filter dropdown with the shared design-system component.", deadline: "2026-07-30", estCompletion: "2026-07-30" },
-  ],
-  pm: [
-    { id: 104, name: "Backfill Jeevansathi match-score history", owner: "Priya Menon", ownerInitials: "PM", assignee: "pm", description: "Backfilled six months of match-score history into the new warehouse table.", deadline: "2026-07-18", estCompletion: "2026-07-17" },
-    { id: 105, name: "Document Hive-to-Presto migration runbook", owner: "Vikram Singh", ownerInitials: "VS", assignee: "pm", description: "Wrote the internal runbook covering rollback steps for the Presto migration.", deadline: "2026-07-10", estCompletion: "2026-07-11" },
-  ],
-  km: [],
-};
-
-const STATUS_LABEL = {
-  "not-picked": "Not Picked",
-  "on-track": "On Track",
-  "at-risk": "At Risk",
-  "overdue": "Overdue",
-  "completed": "Completed",
-};
-
+/* =========================================================================
+   PART C — STATE  (single source of truth — Sortable only reflects this)
+   Each task carries the Google Sheet's field names directly:
+   Task_ID, Task_Name, Description, Owner_Name, Assigned_To, Deadline,
+   Start_Date, Effort_Estimation_Days, Traffic_Light_Color, Status,
+   Priority_Rank, WIP_Override_Reason, Estimated_completion_Date
+   ========================================================================= */
+let tasks = [];
 let selectedAssignees = ["ar", "vs", "pm"]; // default up to 3 shown side-by-side
 
-/* ============ RENDER: FILTER PANEL ============ */
+function setTasks(newTasks) {
+  tasks = newTasks || [];
+  renderBoard();
+}
+
+/* =========================================================================
+   PART D — DERIVED / DISPLAY HELPERS
+   Traffic_Light_Color is the urgency signal the server computes and stores
+   (separate from workflow Status). We fall back to a local estimate for
+   tasks that haven't round-tripped through the server yet (e.g. right
+   after local creation, before the response lands).
+   ========================================================================= */
+function trafficLightClass(t) {
+  const color = (t.Traffic_Light_Color || '').toLowerCase();
+  if (color === 'green')  return 'status-on-track';
+  if (color === 'yellow') return 'status-at-risk';
+  if (color === 'red')    return 'status-overdue';
+  if (color === 'grey' || color === 'gray') return 'status-not-picked';
+  return `status-${estimateTrafficLight(t)}`;
+}
+
+function estimateTrafficLight(t) {
+  if (!t.Deadline) return 'not-picked';
+  const daysLeft = getWorkingDaysBetween(new Date(), new Date(t.Deadline));
+  if (t.Status === 'Not Picked') return 'not-picked';
+  if (daysLeft < 0) return 'overdue';
+  if (daysLeft <= 1) return 'at-risk';
+  return 'on-track';
+}
+
+function daysChipText(t) {
+  if (!t.Deadline) return '—';
+  const daysLeft = getWorkingDaysBetween(new Date(), new Date(t.Deadline));
+  const start = t.Start_Date || t.Assigned_Date;
+  const daysTotal = start ? getWorkingDaysBetween(new Date(start), new Date(t.Deadline)) : daysLeft;
+  return `${daysLeft}/${daysTotal} Days`;
+}
+
+function fmtDate(d) {
+  if (!d) return '—';
+  const dt = new Date(d);
+  if (isNaN(dt)) return String(d);
+  return dt.toISOString().slice(0, 10);
+}
+
+function estCompletionText(t) {
+  if (t.Estimated_completion_Date) return fmtDate(t.Estimated_completion_Date);
+  if (t.Effort_Estimation_Days) {
+    const base = t.Start_Date || t.Assigned_Date || new Date();
+    return fmtDate(addWorkingDays(base, t.Effort_Estimation_Days));
+  }
+  return '—';
+}
+
+/* =========================================================================
+   PART E — FILTER PANEL (unchanged behaviour, kept from the prototype)
+   ========================================================================= */
 function renderFilterOptions() {
   const wrap = document.getElementById("filterOptions");
   wrap.innerHTML = "";
@@ -788,7 +955,7 @@ function renderFilterTrigger() {
   const label = document.getElementById("filterLabel");
   stack.innerHTML = "";
   selectedAssignees.forEach(id => {
-    const a = ASSIGNEES.find(x => x.id === id);
+    const a = assigneeById(id);
     const span = document.createElement("span");
     span.textContent = a.initials;
     stack.appendChild(span);
@@ -811,26 +978,24 @@ document.addEventListener("click", () => {
 });
 document.getElementById("filterPanel").addEventListener("click", (e) => e.stopPropagation());
 
-/* ============ RENDER: BOARD ============ */
-function daysChipText(t) {
-  const n = Math.max(t.daysLeft, t.status === "overdue" ? t.daysLeft : t.daysLeft);
-  return `${t.daysLeft}/${t.daysTotal} Days`;
-}
-
+/* =========================================================================
+   PART F — BOARD RENDER  (rebuilds every column's DOM from `tasks`)
+   Re-rendering after every drag — even cancelled ones — is what lets us
+   "revert" a Sortable-initiated DOM move without fighting the library.
+   ========================================================================= */
 function renderTaskCard(t) {
   const card = document.createElement("div");
-  card.className = `task-card status-${t.status}`;
+  card.className = `task-card ${trafficLightClass(t)}`;
   card.tabIndex = 0;
   card.setAttribute("role", "button");
-  card.dataset.taskId = t.id;
-  card.dataset.source = "active";
+  card.dataset.taskId = t.Task_ID;
   card.innerHTML = `
     <div class="task-top">
-      <div class="initials-badge">${t.ownerInitials}</div>
+      <div class="initials-badge">${(assigneeByName(t.Owner_Name) || {}).initials || (t.Owner_Name || '?').slice(0,2).toUpperCase()}</div>
       <div class="days-chip">${daysChipText(t)}</div>
     </div>
-    <p class="task-name">${t.name}</p>
-    <div class="task-meta">${STATUS_LABEL[t.status]}</div>
+    <p class="task-name">${t.Task_Name}${t.Status === 'WIP' ? '<span class="wip-flag">WIP</span>' : ''}</p>
+    <div class="task-meta">${t.Status}</div>
   `;
   card.addEventListener("click", () => openTaskModal(t));
   card.addEventListener("keydown", (e) => { if (e.key === "Enter") openTaskModal(t); });
@@ -838,9 +1003,12 @@ function renderTaskCard(t) {
 }
 
 function renderColumn(assigneeId) {
-  const person = ASSIGNEES.find(a => a.id === assigneeId);
-  const activeTasks = TASKS.filter(t => t.assignee === assigneeId);
-  const completed = COMPLETED_TASKS[assigneeId] || [];
+  const person = assigneeById(assigneeId);
+  const activeTasks = tasks
+    .filter(t => assigneeByName(t.Assigned_To)?.id === assigneeId && t.Status !== 'Done')
+    .sort((a, b) => (a.Priority_Rank ?? 0) - (b.Priority_Rank ?? 0));
+  const completed = tasks
+    .filter(t => assigneeByName(t.Assigned_To)?.id === assigneeId && t.Status === 'Done');
 
   const col = document.createElement("section");
   col.className = "column";
@@ -853,7 +1021,7 @@ function renderColumn(assigneeId) {
       </div>
       <div class="count">${activeTasks.length} active</div>
     </div>
-    <div class="column-body" id="col-body-${assigneeId}"></div>
+    <div class="column-body task-list" id="col-body-${assigneeId}" data-assignee="${assigneeId}"></div>
     <div class="completed-section">
       <button class="completed-toggle" aria-expanded="false" data-target="completed-${assigneeId}">
         <span>Completed Tasks <span class="badge-count">${completed.length}</span></span>
@@ -874,8 +1042,8 @@ function renderColumn(assigneeId) {
   completed.forEach(t => {
     const item = document.createElement("div");
     item.className = "completed-item";
-    item.innerHTML = `<span class="tick">✓</span><span class="name">${t.name}</span>`;
-    item.addEventListener("click", () => openTaskModal({ ...t, status: "completed" }));
+    item.innerHTML = `<span class="tick">✓</span><span class="name">${t.Task_Name}</span>`;
+    item.addEventListener("click", () => openTaskModal(t));
     completedList.appendChild(item);
   });
 
@@ -890,6 +1058,7 @@ function renderBoard() {
     return;
   }
   selectedAssignees.forEach(id => board.appendChild(renderColumn(id)));
+  initSortableForVisibleColumns();
 }
 
 /* accordion toggle (event delegation) */
@@ -901,23 +1070,144 @@ document.getElementById("board").addEventListener("click", (e) => {
   btn.setAttribute("aria-expanded", isOpen);
 });
 
-/* ============ TASK DETAIL MODAL ============ */
+/* =========================================================================
+   PART G — DRAG & DROP  (was app.js §3–6)
+   Only columns currently on screen (the up-to-3 selected assignees) can be
+   drag targets, so we (re)init Sortable after every renderBoard().
+   ========================================================================= */
+function initSortableForVisibleColumns() {
+  document.querySelectorAll('.task-list').forEach((column) => {
+    new Sortable(column, {
+      group: 'kanban-assignees',
+      animation: 150,
+      onEnd: handleDragEnd,
+    });
+  });
+}
+
+function handleDragEnd(evt) {
+  const taskId = evt.item.dataset.taskId;
+  const task = tasks.find(t => String(t.Task_ID) === String(taskId));
+  if (!task) return;
+
+  const fromAssignee = evt.from.dataset.assignee;
+  const toAssignee = evt.to.dataset.assignee;
+
+  if (fromAssignee === toAssignee) {
+    handleVerticalReorder(task, evt.oldIndex, evt.newIndex, fromAssignee);
+  } else {
+    handleHorizontalReassignment(task, toAssignee);
+  }
+}
+
+function handleVerticalReorder(task, oldIndex, newIndex, assigneeId) {
+  const isDeprioritizing = newIndex > oldIndex;
+
+  if (task.Status === 'WIP' && isDeprioritizing) {
+    // Intercept: re-render first to snap the DOM back to current state,
+    // undoing Sortable's optimistic move, then ask for a reason.
+    renderBoard();
+    showWipOverrideModal(task, (reason) => {
+      applyReorder(assigneeId, oldIndex, newIndex);
+      renderBoard();
+
+      updateTask(task.Task_ID, {
+        WIP_Override_Reason: reason,
+        Priority_Rank: task.Priority_Rank,
+      }).catch((err) => showSyncToast(`Failed to sync WIP override for "${task.Task_Name}"`, err));
+    });
+    return; // on cancel, nothing further — DOM already reverted
+  }
+
+  applyReorder(assigneeId, oldIndex, newIndex);
+  renderBoard();
+
+  updateTask(task.Task_ID, { Priority_Rank: task.Priority_Rank }).catch((err) =>
+    showSyncToast(`Failed to sync reorder for "${task.Task_Name}"`, err)
+  );
+}
+
+function applyReorder(assigneeId, oldIndex, newIndex) {
+  const columnTasks = tasks
+    .filter(t => assigneeByName(t.Assigned_To)?.id === assigneeId && t.Status !== 'Done')
+    .sort((a, b) => (a.Priority_Rank ?? 0) - (b.Priority_Rank ?? 0));
+
+  const [moved] = columnTasks.splice(oldIndex, 1);
+  columnTasks.splice(newIndex, 0, moved);
+
+  columnTasks.forEach((t, i) => { t.Priority_Rank = i; });
+}
+
+function handleHorizontalReassignment(task, newAssigneeId) {
+  const newAssignee = assigneeById(newAssigneeId);
+  task.Assigned_To = newAssignee.name;
+
+  const targetColumnTasks = tasks.filter(
+    t => assigneeByName(t.Assigned_To)?.id === newAssigneeId && t.Task_ID !== task.Task_ID && t.Status !== 'Done'
+  );
+  const maxRank = targetColumnTasks.reduce((max, t) => Math.max(max, t.Priority_Rank ?? 0), -1);
+  task.Priority_Rank = maxRank + 1;
+
+  renderBoard();
+
+  updateTask(task.Task_ID, {
+    Assigned_To: task.Assigned_To,
+    Priority_Rank: task.Priority_Rank,
+  }).catch((err) => showSyncToast(`Failed to sync reassignment for "${task.Task_Name}"`, err));
+}
+
+/* =========================================================================
+   PART H — TASK DETAIL MODAL  (status edits + the Not Picked -> active gate)
+   ========================================================================= */
+let activeModalTask = null;
+
 function openTaskModal(t) {
-  document.getElementById("taskModalTitle").textContent = t.name;
-  document.getElementById("taskModalOwnerLine").textContent = `Owner · ${t.owner || t.ownerInitials}`;
-  document.getElementById("taskModalDescription").textContent = t.description || "No description provided.";
-  document.getElementById("taskModalDeadline").textContent = t.deadline || "—";
-  document.getElementById("taskModalEstCompletion").textContent = t.estCompletion || "—";
-  document.getElementById("taskModalStatus").value = t.status || "not-picked";
+  activeModalTask = t;
+  document.getElementById("taskModalTitle").textContent = t.Task_Name;
+  document.getElementById("taskModalOwnerLine").textContent = `Owner · ${t.Owner_Name || '—'}`;
+  document.getElementById("taskModalDescription").textContent = t.Description || "No description provided.";
+  document.getElementById("taskModalDeadline").textContent = fmtDate(t.Deadline);
+  document.getElementById("taskModalEstCompletion").textContent = estCompletionText(t);
+  document.getElementById("taskModalStatus").value = t.Status || "Not Picked";
+  document.getElementById("taskModalEffort").value = t.Effort_Estimation_Days || "";
+  document.getElementById("taskModalEffortHint").style.display = "none";
   openModal("taskModalOverlay");
 }
 
-document.getElementById("taskModalSave").addEventListener("click", () => {
-  // Prototype only — no backend wiring yet.
-  closeModal("taskModalOverlay");
+document.getElementById("taskModalStatus").addEventListener("change", (e) => {
+  const hint = document.getElementById("taskModalEffortHint");
+  const activating = e.target.value !== 'Not Picked' && activeModalTask && activeModalTask.Status === 'Not Picked';
+  hint.style.display = activating ? "block" : "none";
 });
 
-/* ============ CREATE TASK MODAL ============ */
+document.getElementById("taskModalSave").addEventListener("click", () => {
+  if (!activeModalTask) return;
+  const newStatus = document.getElementById("taskModalStatus").value;
+  const effortRaw = document.getElementById("taskModalEffort").value;
+  const effort = effortRaw ? parseFloat(effortRaw) : null;
+
+  const isActivating = activeModalTask.Status === 'Not Picked' && ['Next Up', 'WIP'].includes(newStatus);
+  if (isActivating && !(effort > 0)) {
+    document.getElementById("taskModalEffortHint").style.display = "block";
+    document.getElementById("taskModalEffort").focus();
+    return; // block save until an estimate is supplied
+  }
+
+  const fields = { Status: newStatus };
+  if (effort > 0) fields.Effort_Estimation_Days = effort;
+
+  Object.assign(activeModalTask, fields);
+  closeModal("taskModalOverlay");
+  renderBoard();
+
+  updateTask(activeModalTask.Task_ID, fields).catch((err) =>
+    showSyncToast(`Failed to save "${activeModalTask.Task_Name}"`, err)
+  );
+});
+
+/* =========================================================================
+   PART I — CREATE TASK MODAL  (was app.js §8.1)
+   ========================================================================= */
 function populateAssigneeSelect() {
   const sel = document.getElementById("newTaskAssignee");
   sel.innerHTML = ASSIGNEES.map(a => `<option value="${a.id}">${a.name}</option>`).join("");
@@ -931,25 +1221,45 @@ document.getElementById("fabAdd").addEventListener("click", () => {
   openModal("createModalOverlay");
 });
 
-document.getElementById("createModalSave").addEventListener("click", () => {
-  // Prototype only — no backend wiring yet.
-  closeModal("createModalOverlay");
+document.getElementById("createModalSave").addEventListener("click", async () => {
+  const saveBtn = document.getElementById("createModalSave");
+  const assigneeId = document.getElementById("newTaskAssignee").value;
+  const newTaskData = {
+    Task_Name: document.getElementById("newTaskName").value.trim(),
+    Description: document.getElementById("newTaskDescription").value.trim(),
+    Owner_Name: document.getElementById("newTaskOwner").value.trim(),
+    Assigned_To: assigneeById(assigneeId).name,
+    Deadline: document.getElementById("newTaskDeadline").value,
+    Start_Date: fmtDate(new Date()),
+    Status: 'Not Picked',
+    Priority_Rank: tasks.filter(t => assigneeByName(t.Assigned_To)?.id === assigneeId && t.Status !== 'Done').length,
+  };
+  if (!newTaskData.Task_Name) return;
+
+  saveBtn.disabled = true;
+  try {
+    const savedTask = await createTask(newTaskData);
+    tasks.push(Object.assign({ Task_ID: savedTask.Task_ID ?? savedTask.id }, newTaskData, savedTask));
+    renderBoard();
+    closeModal("createModalOverlay");
+  } catch (err) {
+    showSyncToast('Failed to create task', err);
+  } finally {
+    saveBtn.disabled = false;
+  }
 });
 
-/* ============ MODAL HELPERS ============ */
-function openModal(id) {
-  document.getElementById(id).classList.add("open");
-}
-function closeModal(id) {
-  document.getElementById(id).classList.remove("open");
-}
+/* =========================================================================
+   PART J — MODALS: shared helpers + the two dynamically-built popups
+   (WIP override confirmation, effort estimation) — was app.js §8
+   ========================================================================= */
+function openModal(id) { document.getElementById(id).classList.add("open"); }
+function closeModal(id) { document.getElementById(id).classList.remove("open"); }
 document.querySelectorAll("[data-close-modal]").forEach(btn => {
   btn.addEventListener("click", () => closeModal(btn.dataset.closeModal));
 });
 document.querySelectorAll(".modal-overlay").forEach(overlay => {
-  overlay.addEventListener("click", (e) => {
-    if (e.target === overlay) closeModal(overlay.id);
-  });
+  overlay.addEventListener("click", (e) => { if (e.target === overlay) closeModal(overlay.id); });
 });
 document.addEventListener("keydown", (e) => {
   if (e.key === "Escape") {
@@ -957,7 +1267,66 @@ document.addEventListener("keydown", (e) => {
   }
 });
 
-/* ============ THEME TOGGLE ============ */
+function showWipOverrideModal(task, onConfirm) {
+  const overlay = document.createElement('div');
+  overlay.className = 'modal-overlay open';
+  overlay.innerHTML = `
+    <div class="modal">
+      <div class="modal-head">
+        <div>
+          <h2>⚠ WIP Task Deprioritization</h2>
+          <div class="task-owner-line">${task.Task_Name}</div>
+        </div>
+      </div>
+      <p class="field-hint" style="font-size:13px;color:var(--text-secondary);margin-bottom:14px;">
+        This task is currently being worked on. Deprioritizing it will halt progress.
+      </p>
+      <div class="field-block">
+        <label for="override-reason">Reason for Override</label>
+        <input type="text" id="override-reason" placeholder="Required">
+      </div>
+      <div class="modal-footer">
+        <button class="btn" id="cancel-move">Cancel</button>
+        <button class="btn primary" id="confirm-move" disabled>Confirm Move</button>
+      </div>
+    </div>`;
+  document.body.appendChild(overlay);
+
+  const reasonInput = overlay.querySelector('#override-reason');
+  const confirmBtn = overlay.querySelector('#confirm-move');
+  const cancelBtn = overlay.querySelector('#cancel-move');
+
+  reasonInput.addEventListener('input', () => {
+    confirmBtn.disabled = reasonInput.value.trim().length === 0;
+  });
+  confirmBtn.addEventListener('click', () => {
+    const reason = reasonInput.value.trim();
+    document.body.removeChild(overlay);
+    onConfirm(reason);
+  });
+  cancelBtn.addEventListener('click', () => {
+    document.body.removeChild(overlay); // no callback — move is abandoned, DOM already reverted
+  });
+}
+
+function showSyncToast(message, err) {
+  console.error(message, err);
+  let toast = document.getElementById('syncToast');
+  if (!toast) {
+    toast = document.createElement('div');
+    toast.id = 'syncToast';
+    toast.className = 'sync-toast';
+    document.body.appendChild(toast);
+  }
+  toast.textContent = `${message}. Your view is up to date locally; it'll retry syncing next change.`;
+  toast.classList.add('show');
+  clearTimeout(toast._hideTimer);
+  toast._hideTimer = setTimeout(() => toast.classList.remove('show'), 4500);
+}
+
+/* =========================================================================
+   PART K — THEME TOGGLE  (unchanged)
+   ========================================================================= */
 const themeToggle = document.getElementById("themeToggle");
 themeToggle.addEventListener("click", () => {
   const html = document.documentElement;
@@ -966,23 +1335,27 @@ themeToggle.addEventListener("click", () => {
   themeToggle.textContent = isDark ? "☀️" : "🌙";
 });
 
-/* ============ INIT ============ */
-renderFilterOptions();
-renderFilterTrigger();
-renderBoard();
-populateAssigneeSelect();
+/* =========================================================================
+   PART L — BOOTSTRAP  (was app.js §9)
+   ========================================================================= */
+async function initializeApp() {
+  renderFilterOptions();
+  renderFilterTrigger();
+  populateAssigneeSelect();
+  renderBoard(); // initial (empty) paint + wires up Sortable
+
+  try {
+    const realTasks = await fetchTasks();
+    setTasks(realTasks);
+  } catch (error) {
+    showSyncToast('Failed to load tasks from the sheet', error);
+  }
+}
+
+initializeApp();
 </script>
 
-<!-- 1. Google API Library (Required for Chat 3 logic) -->
-    <script src="https://apis.google.com/js/api.js"></script>
-    
-    <!-- 2. SortableJS (If you used it in Chat 2 for Drag-and-Drop) -->
-    <script src="https://cdn.jsdelivr.net/npm/sortablejs@latest/Sortable.min.js"></script>
-    
-    <!-- 3. Your Backend Service -->
-    <script src="api-service.js"></script>
-    
-    <!-- 4. Your UI and App Logic -->
-    <script src="app.js"></script>
+<!-- SortableJS powers the drag-and-drop reordering / reassignment -->
+<script src="https://cdn.jsdelivr.net/npm/sortablejs@1.15.2/Sortable.min.js"></script>
 </body>
 </html>
